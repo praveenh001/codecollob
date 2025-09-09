@@ -6,6 +6,8 @@ const { v4: uuidv4 } = require('uuid');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const tmp = require('tmp');
 
 const app = express();
 const server = http.createServer(app);
@@ -71,90 +73,143 @@ app.get('/api/rooms/:roomId', (req, res) => {
 // Execute code endpoint
 app.post('/api/execute', (req, res) => {
   const { code, language, roomId } = req.body;
-  
+
   if (!rooms.has(roomId)) {
     return res.status(404).json({ error: 'Room not found' });
   }
-  
-  // Enhanced language support
-  const languageCommands = {
-    'javascript': ['node', ['-e', code]],
-    'typescript': ['ts-node', ['-e', code]],
-    'python': ['python3', ['-c', code]],
-    'java': ['java', ['-']],
-    'cpp': ['g++', ['-x', 'c++', '-', '-o', '/tmp/program', '&&', '/tmp/program']],
-    'c': ['gcc', ['-x', 'c', '-', '-o', '/tmp/program', '&&', '/tmp/program']],
-    'go': ['go', ['run', '-']],
-    'rust': ['rustc', ['-', '-o', '/tmp/program', '&&', '/tmp/program']],
-    'php': ['php', ['-r', code]],
-    'ruby': ['ruby', ['-e', code]],
-    'shell': ['bash', ['-c', code]]
-  };
-  
+
   let child;
   let output = '';
   let errorOutput = '';
-  
+
   const timeout = setTimeout(() => {
     if (child) {
       child.kill();
     }
-    res.json({ 
+    res.json({
       output: output + '\n[Execution timed out after 10 seconds]',
-      error: true 
+      error: true
     });
   }, 10000);
-  
+
+  function sendResult(finalOutput, code) {
+    clearTimeout(timeout);
+    io.to(roomId).emit('code-executed', {
+      output: finalOutput,
+      exitCode: code
+    });
+    res.json({
+      output: finalOutput,
+      exitCode: code,
+      error: code !== 0
+    });
+  }
+
   try {
-    const langCommand = languageCommands[language];
-    
-    if (!langCommand) {
+    if (language === 'javascript') {
+      child = spawn('node', ['-e', code]);
+    } else if (language === 'python') {
+      // Use 'python' on Windows, 'python3' elsewhere
+      const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+      child = spawn(pythonCmd, ['-c', code]);
+    } else if (language === 'c') {
+      const tmpFile = tmp.fileSync({ postfix: '.c' });
+      fs.writeFileSync(tmpFile.name, code);
+      const exeFile = tmp.tmpNameSync({ postfix: process.platform === 'win32' ? '.exe' : '' });
+
+      const compile = spawn('gcc', [tmpFile.name, '-o', exeFile]);
+      compile.on('close', (compileCode) => {
+        if (compileCode !== 0) {
+          sendResult('Compilation failed', compileCode);
+          return;
+        }
+        child = spawn(exeFile);
+        child.stdout.on('data', (data) => output += data.toString());
+        child.stderr.on('data', (data) => errorOutput += data.toString());
+        child.on('close', (runCode) => {
+          sendResult(output + (errorOutput ? `\nError: ${errorOutput}` : ''), runCode);
+          fs.unlinkSync(tmpFile.name);
+          fs.unlinkSync(exeFile);
+        });
+      });
+      compile.stderr.on('data', (data) => errorOutput += data.toString());
+      return;
+    } else if (language === 'cpp') {
+      const tmpFile = tmp.fileSync({ postfix: '.cpp' });
+      fs.writeFileSync(tmpFile.name, code);
+      const exeFile = tmp.tmpNameSync({ postfix: process.platform === 'win32' ? '.exe' : '' });
+
+      const compile = spawn('g++', [tmpFile.name, '-o', exeFile]);
+      compile.on('close', (compileCode) => {
+        if (compileCode !== 0) {
+          sendResult('Compilation failed', compileCode);
+          return;
+        }
+        child = spawn(exeFile);
+        child.stdout.on('data', (data) => output += data.toString());
+        child.stderr.on('data', (data) => errorOutput += data.toString());
+        child.on('close', (runCode) => {
+          sendResult(output + (errorOutput ? `\nError: ${errorOutput}` : ''), runCode);
+          fs.unlinkSync(tmpFile.name);
+          fs.unlinkSync(exeFile);
+        });
+      });
+      compile.stderr.on('data', (data) => errorOutput += data.toString());
+      return;
+    } else if (language === 'java') {
+      // Write to Main.java, compile, then run
+      const tmpDir = tmp.dirSync();
+      const javaFile = path.join(tmpDir.name, 'Main.java');
+      fs.writeFileSync(javaFile, code);
+
+      const compile = spawn('javac', [javaFile]);
+      compile.on('close', (compileCode) => {
+        if (compileCode !== 0) {
+          sendResult('Compilation failed', compileCode);
+          return;
+        }
+        // Run: java -cp <dir> Main
+        child = spawn('java', ['-cp', tmpDir.name, 'Main']);
+        child.stdout.on('data', (data) => output += data.toString());
+        child.stderr.on('data', (data) => errorOutput += data.toString());
+        child.on('close', (runCode) => {
+          sendResult(output + (errorOutput ? `\nError: ${errorOutput}` : ''), runCode);
+          fs.rmSync(tmpDir.name, { recursive: true, force: true });
+        });
+      });
+      compile.stderr.on('data', (data) => errorOutput += data.toString());
+      return;
+    } else if (language === 'go') {
+      const tmpFile = tmp.fileSync({ postfix: '.go' });
+      fs.writeFileSync(tmpFile.name, code);
+
+      child = spawn('go', ['run', tmpFile.name]);
+      child.stdout.on('data', (data) => output += data.toString());
+      child.stderr.on('data', (data) => errorOutput += data.toString());
+      child.on('close', (runCode) => {
+        sendResult(output + (errorOutput ? `\nError: ${errorOutput}` : ''), runCode);
+        fs.unlinkSync(tmpFile.name);
+      });
+      return;
+    } else {
       clearTimeout(timeout);
-      return res.json({ 
-        output: `Unsupported language: ${language}. Supported languages: ${Object.keys(languageCommands).join(', ')}`,
-        error: true 
+      return res.json({
+        output: `Unsupported language: ${language}`,
+        error: true
       });
     }
-    
-    const [command, args] = langCommand;
-    child = spawn(command, args);
-    
-    // For languages that need stdin input
-    if (['java', 'cpp', 'c', 'go', 'rust'].includes(language)) {
-      child.stdin.write(code);
-      child.stdin.end();
-    }
-    
-    child.stdout.on('data', (data) => {
-      output += data.toString();
-    });
-    
-    child.stderr.on('data', (data) => {
-      errorOutput += data.toString();
-    });
-    
+
+    child.stdout.on('data', (data) => output += data.toString());
+    child.stderr.on('data', (data) => errorOutput += data.toString());
     child.on('close', (code) => {
-      clearTimeout(timeout);
-      const finalOutput = output + (errorOutput ? `\nError: ${errorOutput}` : '');
-      
-      // Broadcast execution result to room
-      io.to(roomId).emit('code-executed', {
-        output: finalOutput,
-        exitCode: code
-      });
-      
-      res.json({ 
-        output: finalOutput, 
-        exitCode: code,
-        error: code !== 0 
-      });
+      sendResult(output + (errorOutput ? `\nError: ${errorOutput}` : ''), code);
     });
-    
+
   } catch (error) {
     clearTimeout(timeout);
-    res.json({ 
+    res.json({
       output: `Execution error: ${error.message}`,
-      error: true 
+      error: true
     });
   }
 });
