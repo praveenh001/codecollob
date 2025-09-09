@@ -1,5 +1,7 @@
 import React, { useRef, useEffect } from 'react';
-import { Terminal as TerminalIcon, Play, Loader } from 'lucide-react';
+import { Terminal as TerminalIcon, Play, Loader, Download } from 'lucide-react';
+import { SUPPORTED_LANGUAGES, LanguageKey } from '../types';
+import { getFileExtension, getLanguageFromExtension } from '../utils/fileSystem';
 
 interface TerminalProps {
   output: string[];
@@ -30,20 +32,49 @@ const Terminal: React.FC<TerminalProps> = ({
     }
 
     const file = files[currentFile];
-    const extension = currentFile.split('.').pop()?.toLowerCase();
-    
-    let language = 'javascript';
-    if (extension === 'py') {
-      language = 'python';
-    }
+    const extension = getFileExtension(currentFile);
+    const language = getLanguageFromExtension(extension);
 
     onExecute(file.content, language);
   };
 
-  const getLanguageFromFile = (fileName: string): string => {
-    const extension = fileName?.split('.').pop()?.toLowerCase();
-    return extension === 'py' ? 'Python' : 'JavaScript';
+  const getLanguageInfo = (fileName: string): { name: string, canExecute: boolean } => {
+    if (!fileName) return { name: 'Unknown', canExecute: false };
+    
+    const extension = getFileExtension(fileName);
+    const language = getLanguageFromExtension(extension) as LanguageKey;
+    
+    if (language in SUPPORTED_LANGUAGES) {
+      const langInfo = SUPPORTED_LANGUAGES[language];
+      return {
+        name: langInfo.name,
+        canExecute: langInfo.runner !== null
+      };
+    }
+    
+    return { name: 'Plain Text', canExecute: false };
   };
+
+  const downloadOutput = () => {
+    const content = output.join('\n');
+    const blob = new Blob([content], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'terminal-output.txt';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const clearOutput = () => {
+    // This would need to be implemented in the parent component
+    // For now, we'll just show a message
+    console.log('Clear output functionality needs to be implemented in parent');
+  };
+
+  const languageInfo = getLanguageInfo(currentFile || '');
 
   return (
     <div className="h-full bg-black text-green-400 font-mono flex flex-col">
@@ -57,17 +88,28 @@ const Terminal: React.FC<TerminalProps> = ({
         <div className="flex items-center gap-2">
           {currentFile && (
             <span className="text-xs text-gray-400">
-              {getLanguageFromFile(currentFile)}
+              {languageInfo.name}
             </span>
           )}
+          
+          <button
+            onClick={downloadOutput}
+            disabled={output.length === 0}
+            className="p-1 hover:bg-gray-700 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Download output"
+          >
+            <Download className="w-3 h-3" />
+          </button>
+          
           <button
             onClick={handleExecute}
-            disabled={!currentFile || isExecuting}
+            disabled={!currentFile || isExecuting || !languageInfo.canExecute}
             className={`flex items-center gap-1 px-3 py-1 rounded text-xs font-medium transition-colors ${
-              !currentFile || isExecuting
+              !currentFile || isExecuting || !languageInfo.canExecute
                 ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
                 : 'bg-green-600 hover:bg-green-700 text-white'
             }`}
+            title={!languageInfo.canExecute ? `${languageInfo.name} files cannot be executed` : ''}
           >
             {isExecuting ? (
               <>
@@ -92,7 +134,19 @@ const Terminal: React.FC<TerminalProps> = ({
         {output.length === 0 ? (
           <div className="text-gray-500">
             <p>Terminal ready. Select a file and click "Run" to execute code.</p>
-            <p className="mt-2 text-xs">Supported languages: JavaScript (.js), Python (.py)</p>
+            <div className="mt-4 text-xs">
+              <p className="font-semibold mb-2">Supported languages for execution:</p>
+              <div className="grid grid-cols-2 gap-1">
+                {Object.entries(SUPPORTED_LANGUAGES)
+                  .filter(([_, lang]) => lang.runner !== null)
+                  .map(([key, lang]) => (
+                    <div key={key} className="flex items-center gap-1">
+                      <span className="w-1 h-1 bg-green-400 rounded-full"></span>
+                      <span>{lang.name}</span>
+                    </div>
+                  ))}
+              </div>
+            </div>
           </div>
         ) : (
           output.map((line, index) => (
@@ -101,6 +155,10 @@ const Terminal: React.FC<TerminalProps> = ({
                 <span className="text-red-400">{line}</span>
               ) : line.includes('Warning') || line.includes('warning') ? (
                 <span className="text-yellow-400">{line}</span>
+              ) : line.startsWith('>') ? (
+                <span className="text-blue-400">{line}</span>
+              ) : line.includes('👋') || line.includes('🚀') || line.includes('📝') ? (
+                <span className="text-cyan-400">{line}</span>
               ) : (
                 <span>{line}</span>
               )}
@@ -111,7 +169,7 @@ const Terminal: React.FC<TerminalProps> = ({
         {isExecuting && (
           <div className="text-blue-400 flex items-center gap-2 mt-2">
             <Loader className="w-3 h-3 animate-spin" />
-            Executing code...
+            Executing {languageInfo.name} code...
           </div>
         )}
         

@@ -6,19 +6,8 @@ import UserList from './components/UserList';
 import RoomManager from './components/RoomManager';
 import useSocket from './hooks/useSocket';
 import { api } from './utils/api';
-
-interface FileItem {
-  name: string;
-  content: string;
-  type: 'file';
-  createdAt?: Date;
-}
-
-interface User {
-  id: string;
-  name: string;
-  joinedAt?: Date;
-}
+import { FileSystemItem, FileItem, FolderItem, User } from './types';
+import { createFile, createFolder, flattenFileSystem } from './utils/fileSystem';
 
 function App() {
   // Room state
@@ -28,7 +17,7 @@ function App() {
   const [isLoading, setIsLoading] = useState(false);
 
   // File system state
-  const [files, setFiles] = useState<{ [key: string]: FileItem }>({});
+  const [fileSystem, setFileSystem] = useState<{ [key: string]: FileSystemItem }>({});
   const [currentFile, setCurrentFile] = useState<string | null>(null);
 
   // Users state
@@ -42,6 +31,9 @@ function App() {
   // Socket connection
   const { socket, isConnected, error } = useSocket();
 
+  // Get flattened files for compatibility with existing code
+  const files = flattenFileSystem(fileSystem);
+
   // Socket event handlers
   useEffect(() => {
     if (!socket) return;
@@ -53,7 +45,25 @@ function App() {
 
     // File synchronization
     socket.on('files-sync', (syncedFiles: { [key: string]: FileItem }) => {
-      setFiles(syncedFiles);
+      // Convert flat structure to hierarchical for backward compatibility
+      const hierarchical: { [key: string]: FileSystemItem } = {};
+      
+      Object.entries(syncedFiles).forEach(([path, file]) => {
+        const parts = path.split('/');
+        let current = hierarchical;
+        
+        for (let i = 0; i < parts.length - 1; i++) {
+          const part = parts[i];
+          if (!current[part]) {
+            current[part] = createFolder(part);
+          }
+          current = (current[part] as FolderItem).children;
+        }
+        
+        current[parts[parts.length - 1]] = file;
+      });
+      
+      setFileSystem(hierarchical);
       if (Object.keys(syncedFiles).length > 0 && !currentFile) {
         setCurrentFile(Object.keys(syncedFiles)[0]);
       }
@@ -61,40 +71,28 @@ function App() {
 
     // Real-time code updates
     socket.on('code-update', ({ fileName, content }) => {
-      setFiles(prev => ({
-        ...prev,
-        [fileName]: { ...prev[fileName], content }
-      }));
+      const flatFiles = flattenFileSystem(fileSystem);
+      if (flatFiles[fileName]) {
+        // Update the file in the hierarchical structure
+        updateFileInHierarchy(fileName, content);
+      }
     });
 
     // File operations
     socket.on('file-created', ({ fileName, file }) => {
-      setFiles(prev => ({ ...prev, [fileName]: file }));
+      addFileToHierarchy(fileName, file);
     });
 
-    socket.on('file-deleted', ({ fileName }) => {
-      setFiles(prev => {
-        const newFiles = { ...prev };
-        delete newFiles[fileName];
-        if (currentFile === fileName) {
-          const remainingFiles = Object.keys(newFiles);
-          setCurrentFile(remainingFiles.length > 0 ? remainingFiles[0] : null);
-        }
-        return newFiles;
-      });
+    socket.on('folder-created', ({ folderName, folder }) => {
+      addFolderToHierarchy(folderName, folder);
     });
 
-    socket.on('file-renamed', ({ oldName, newName }) => {
-      setFiles(prev => {
-        const newFiles = { ...prev };
-        newFiles[newName] = { ...newFiles[oldName], name: newName };
-        delete newFiles[oldName];
-        return newFiles;
-      });
-      
-      if (currentFile === oldName) {
-        setCurrentFile(newName);
-      }
+    socket.on('item-deleted', ({ path }) => {
+      removeItemFromHierarchy(path);
+    });
+
+    socket.on('item-renamed', ({ oldPath, newPath }) => {
+      renameItemInHierarchy(oldPath, newPath);
     });
 
     // User management
@@ -132,15 +130,126 @@ function App() {
       socket.off('files-sync');
       socket.off('code-update');
       socket.off('file-created');
-      socket.off('file-deleted');
-      socket.off('file-renamed');
+      socket.off('folder-created');
+      socket.off('item-deleted');
+      socket.off('item-renamed');
       socket.off('users-list');
       socket.off('user-joined');
       socket.off('user-left');
       socket.off('code-executed');
       socket.off('error');
     };
-  }, [socket, currentFile, users]);
+  }, [socket, currentFile, users, fileSystem]);
+
+  // Helper functions for hierarchical file system
+  const updateFileInHierarchy = (path: string, content: string) => {
+    setFileSystem(prev => {
+      const newFileSystem = { ...prev };
+      const parts = path.split('/');
+      let current: any = newFileSystem;
+      
+      for (let i = 0; i < parts.length - 1; i++) {
+        current = current[parts[i]].children;
+      }
+      
+      const fileName = parts[parts.length - 1];
+      if (current[fileName] && current[fileName].type === 'file') {
+        current[fileName] = { ...current[fileName], content };
+      }
+      
+      return newFileSystem;
+    });
+  };
+
+  const addFileToHierarchy = (path: string, file: FileItem) => {
+    setFileSystem(prev => {
+      const newFileSystem = { ...prev };
+      const parts = path.split('/');
+      let current: any = newFileSystem;
+      
+      for (let i = 0; i < parts.length - 1; i++) {
+        const part = parts[i];
+        if (!current[part]) {
+          current[part] = createFolder(part);
+        }
+        current = current[part].children;
+      }
+      
+      current[parts[parts.length - 1]] = file;
+      return newFileSystem;
+    });
+  };
+
+  const addFolderToHierarchy = (path: string, folder: FolderItem) => {
+    setFileSystem(prev => {
+      const newFileSystem = { ...prev };
+      const parts = path.split('/');
+      let current: any = newFileSystem;
+      
+      for (let i = 0; i < parts.length - 1; i++) {
+        const part = parts[i];
+        if (!current[part]) {
+          current[part] = createFolder(part);
+        }
+        current = current[part].children;
+      }
+      
+      current[parts[parts.length - 1]] = folder;
+      return newFileSystem;
+    });
+  };
+
+  const removeItemFromHierarchy = (path: string) => {
+    setFileSystem(prev => {
+      const newFileSystem = { ...prev };
+      const parts = path.split('/');
+      let current: any = newFileSystem;
+      
+      for (let i = 0; i < parts.length - 1; i++) {
+        current = current[parts[i]].children;
+      }
+      
+      delete current[parts[parts.length - 1]];
+      
+      if (currentFile === path) {
+        const remainingFiles = Object.keys(flattenFileSystem(newFileSystem));
+        setCurrentFile(remainingFiles.length > 0 ? remainingFiles[0] : null);
+      }
+      
+      return newFileSystem;
+    });
+  };
+
+  const renameItemInHierarchy = (oldPath: string, newPath: string) => {
+    setFileSystem(prev => {
+      const newFileSystem = { ...prev };
+      
+      // Get the item to rename
+      const oldParts = oldPath.split('/');
+      let oldCurrent: any = newFileSystem;
+      for (let i = 0; i < oldParts.length - 1; i++) {
+        oldCurrent = oldCurrent[oldParts[i]].children;
+      }
+      const item = oldCurrent[oldParts[oldParts.length - 1]];
+      
+      // Add to new location
+      const newParts = newPath.split('/');
+      let newCurrent: any = newFileSystem;
+      for (let i = 0; i < newParts.length - 1; i++) {
+        newCurrent = newCurrent[newParts[i]].children;
+      }
+      newCurrent[newParts[newParts.length - 1]] = { ...item, name: newParts[newParts.length - 1] };
+      
+      // Remove from old location
+      delete oldCurrent[oldParts[oldParts.length - 1]];
+      
+      if (currentFile === oldPath) {
+        setCurrentFile(newPath);
+      }
+      
+      return newFileSystem;
+    });
+  };
 
   // Room management functions
   const createRoom = useCallback(async () => {
@@ -185,41 +294,76 @@ function App() {
   }, [socket]);
 
   // File operations
-  const handleFileSelect = useCallback((fileName: string) => {
-    setCurrentFile(fileName);
+  const handleFileSelect = useCallback((filePath: string) => {
+    setCurrentFile(filePath);
   }, []);
 
-  const handleFileCreate = useCallback((fileName: string) => {
+  const handleFileCreate = useCallback((parentPath: string, fileName: string) => {
     if (!socket || !roomId) return;
     
+    const fullPath = parentPath ? `${parentPath}/${fileName}` : fileName;
+    const file = createFile(fileName);
+    
     socket.emit('create-file', { 
-      fileName, 
-      content: `// New file: ${fileName}\n`, 
+      fileName: fullPath, 
+      content: file.content, 
       roomId 
     });
   }, [socket, roomId]);
 
-  const handleFileDelete = useCallback((fileName: string) => {
+  const handleFolderCreate = useCallback((parentPath: string, folderName: string) => {
     if (!socket || !roomId) return;
     
-    socket.emit('delete-file', { fileName, roomId });
+    const fullPath = parentPath ? `${parentPath}/${folderName}` : folderName;
+    const folder = createFolder(folderName);
+    
+    socket.emit('create-folder', { 
+      folderName: fullPath, 
+      folder, 
+      roomId 
+    });
   }, [socket, roomId]);
 
-  const handleFileRename = useCallback((oldName: string, newName: string) => {
+  const handleItemDelete = useCallback((path: string) => {
     if (!socket || !roomId) return;
     
-    socket.emit('rename-file', { oldName, newName, roomId });
+    socket.emit('delete-item', { path, roomId });
   }, [socket, roomId]);
+
+  const handleItemRename = useCallback((oldPath: string, newName: string) => {
+    if (!socket || !roomId) return;
+    
+    const pathParts = oldPath.split('/');
+    pathParts[pathParts.length - 1] = newName;
+    const newPath = pathParts.join('/');
+    
+    socket.emit('rename-item', { oldPath, newPath, roomId });
+  }, [socket, roomId]);
+
+  const handleFolderToggle = useCallback((path: string) => {
+    setFileSystem(prev => {
+      const newFileSystem = { ...prev };
+      const parts = path.split('/');
+      let current: any = newFileSystem;
+      
+      for (let i = 0; i < parts.length - 1; i++) {
+        current = current[parts[i]].children;
+      }
+      
+      const folder = current[parts[parts.length - 1]];
+      if (folder && folder.type === 'folder') {
+        folder.expanded = !folder.expanded;
+      }
+      
+      return newFileSystem;
+    });
+  }, []);
 
   // Code editing
   const handleCodeChange = useCallback((content: string) => {
     if (!currentFile || !socket || !roomId) return;
     
-    setFiles(prev => ({
-      ...prev,
-      [currentFile]: { ...prev[currentFile], content }
-    }));
-    
+    updateFileInHierarchy(currentFile, content);
     socket.emit('code-change', { fileName: currentFile, content, roomId });
   }, [currentFile, socket, roomId]);
 
@@ -305,18 +449,20 @@ function App() {
         {/* File Explorer */}
         <div className="w-64 border-r border-gray-300">
           <FileExplorer
-            files={files}
+            items={fileSystem}
             currentFile={currentFile}
             onFileSelect={handleFileSelect}
             onFileCreate={handleFileCreate}
-            onFileDelete={handleFileDelete}
-            onFileRename={handleFileRename}
+            onFolderCreate={handleFolderCreate}
+            onItemDelete={handleItemDelete}
+            onItemRename={handleItemRename}
+            onFolderToggle={handleFolderToggle}
           />
         </div>
 
         {/* Code Editor */}
         <div className="flex-1 flex flex-col">
-          {currentFile ? (
+          {currentFile && files[currentFile] ? (
             <>
               <div className="bg-gray-200 px-4 py-2 border-b border-gray-300 flex items-center gap-2">
                 <span className="text-sm font-medium">{currentFile}</span>

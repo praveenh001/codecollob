@@ -28,7 +28,7 @@ app.use(express.json());
 
 // In-memory storage for rooms
 const rooms = new Map();
-const roomFiles = new Map();
+const roomFileSystem = new Map();
 
 // Room structure: { id, users: [], files: {}, currentFile: null }
 
@@ -46,7 +46,7 @@ app.post('/api/rooms/create', (req, res) => {
     createdAt: new Date()
   });
   
-  roomFiles.set(roomId, {
+  roomFileSystem.set(roomId, {
     'main.js': {
       name: 'main.js',
       content: '// Welcome to the collaborative code editor!\nconsole.log("Hello, World!");',
@@ -76,6 +76,21 @@ app.post('/api/execute', (req, res) => {
     return res.status(404).json({ error: 'Room not found' });
   }
   
+  // Enhanced language support
+  const languageCommands = {
+    'javascript': ['node', ['-e', code]],
+    'typescript': ['ts-node', ['-e', code]],
+    'python': ['python3', ['-c', code]],
+    'java': ['java', ['-']],
+    'cpp': ['g++', ['-x', 'c++', '-', '-o', '/tmp/program', '&&', '/tmp/program']],
+    'c': ['gcc', ['-x', 'c', '-', '-o', '/tmp/program', '&&', '/tmp/program']],
+    'go': ['go', ['run', '-']],
+    'rust': ['rustc', ['-', '-o', '/tmp/program', '&&', '/tmp/program']],
+    'php': ['php', ['-r', code]],
+    'ruby': ['ruby', ['-e', code]],
+    'shell': ['bash', ['-c', code]]
+  };
+  
   let child;
   let output = '';
   let errorOutput = '';
@@ -91,16 +106,23 @@ app.post('/api/execute', (req, res) => {
   }, 10000);
   
   try {
-    if (language === 'javascript') {
-      child = spawn('node', ['-e', code]);
-    } else if (language === 'python') {
-      child = spawn('python3', ['-c', code]);
-    } else {
+    const langCommand = languageCommands[language];
+    
+    if (!langCommand) {
       clearTimeout(timeout);
       return res.json({ 
-        output: 'Unsupported language. Only JavaScript and Python are supported.',
+        output: `Unsupported language: ${language}. Supported languages: ${Object.keys(languageCommands).join(', ')}`,
         error: true 
       });
+    }
+    
+    const [command, args] = langCommand;
+    child = spawn(command, args);
+    
+    // For languages that need stdin input
+    if (['java', 'cpp', 'c', 'go', 'rust'].includes(language)) {
+      child.stdin.write(code);
+      child.stdin.end();
     }
     
     child.stdout.on('data', (data) => {
@@ -156,7 +178,7 @@ io.on('connection', (socket) => {
     room.users.push({ id: socket.id, name: userName, joinedAt: new Date() });
     
     // Send current files to the newly joined user
-    const files = roomFiles.get(roomId) || {};
+    const files = roomFileSystem.get(roomId) || {};
     socket.emit('files-sync', files);
     
     // Notify other users
@@ -173,11 +195,11 @@ io.on('connection', (socket) => {
   
   // Handle code changes
   socket.on('code-change', ({ fileName, content, roomId }) => {
-    if (!roomFiles.has(roomId)) {
-      roomFiles.set(roomId, {});
+    if (!roomFileSystem.has(roomId)) {
+      roomFileSystem.set(roomId, {});
     }
     
-    const files = roomFiles.get(roomId);
+    const files = roomFileSystem.get(roomId);
     if (files[fileName]) {
       files[fileName].content = content;
       
@@ -197,11 +219,11 @@ io.on('connection', (socket) => {
   
   // File operations
   socket.on('create-file', ({ fileName, content = '', roomId }) => {
-    if (!roomFiles.has(roomId)) {
-      roomFiles.set(roomId, {});
+    if (!roomFileSystem.has(roomId)) {
+      roomFileSystem.set(roomId, {});
     }
     
-    const files = roomFiles.get(roomId);
+    const files = roomFileSystem.get(roomId);
     files[fileName] = {
       name: fileName,
       content: content,
@@ -213,25 +235,45 @@ io.on('connection', (socket) => {
     io.to(roomId).emit('file-created', { fileName, file: files[fileName] });
   });
   
-  socket.on('delete-file', ({ fileName, roomId }) => {
-    if (roomFiles.has(roomId)) {
-      const files = roomFiles.get(roomId);
-      delete files[fileName];
+  socket.on('create-folder', ({ folderName, folder, roomId }) => {
+    if (!roomFileSystem.has(roomId)) {
+      roomFileSystem.set(roomId, {});
+    }
+    
+    const files = roomFileSystem.get(roomId);
+    files[folderName] = {
+      name: folderName,
+      type: 'folder',
+      children: {},
+      expanded: true,
+      createdAt: new Date()
+    };
+    
+    // Broadcast to all users in room
+    io.to(roomId).emit('folder-created', { folderName, folder: files[folderName] });
+  });
+  
+  socket.on('delete-item', ({ path, roomId }) => {
+    if (roomFileSystem.has(roomId)) {
+      const files = roomFileSystem.get(roomId);
+      delete files[path];
       
       // Broadcast to all users in room
-      io.to(roomId).emit('file-deleted', { fileName });
+      io.to(roomId).emit('item-deleted', { path });
     }
   });
   
-  socket.on('rename-file', ({ oldName, newName, roomId }) => {
-    if (roomFiles.has(roomId)) {
-      const files = roomFiles.get(roomId);
-      if (files[oldName]) {
-        files[newName] = { ...files[oldName], name: newName };
-        delete files[oldName];
+  socket.on('rename-item', ({ oldPath, newPath, roomId }) => {
+    if (roomFileSystem.has(roomId)) {
+      const files = roomFileSystem.get(roomId);
+      if (files[oldPath]) {
+        const item = files[oldPath];
+        const newName = newPath.split('/').pop();
+        files[newPath] = { ...item, name: newName };
+        delete files[oldPath];
         
         // Broadcast to all users in room
-        io.to(roomId).emit('file-renamed', { oldName, newName });
+        io.to(roomId).emit('item-renamed', { oldPath, newPath });
       }
     }
   });
@@ -253,7 +295,7 @@ io.on('connection', (socket) => {
       // Clean up empty rooms
       if (room.users.length === 0) {
         rooms.delete(socket.roomId);
-        roomFiles.delete(socket.roomId);
+        roomFileSystem.delete(socket.roomId);
         console.log(`Room ${socket.roomId} deleted (empty)`);
       }
     }
