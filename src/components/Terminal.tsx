@@ -130,6 +130,11 @@ const Terminal: React.FC<TerminalProps> = ({
       <div 
         ref={outputRef}
         className="flex-1 p-4 overflow-y-auto whitespace-pre-wrap text-sm leading-relaxed"
+        style={{
+          minHeight: '120px',
+          maxHeight: '300px',
+          scrollbarWidth: 'thin', // For Firefox
+        }}
       >
         {output.length === 0 ? (
           <div className="text-gray-500">
